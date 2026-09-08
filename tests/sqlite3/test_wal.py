@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 from typing import TYPE_CHECKING
 
 import pytest
@@ -59,28 +60,48 @@ def test_sqlite_wal_checkpoint(sqlite_db: Path, sqlite_wal: Path, db_as_path: bo
     [pytest.param(True, id="wal_as_path"), pytest.param(False, id="wal_as_fh")],
 )
 def test_sqlite_wal_checksum_validation(sqlite_db: Path, sqlite_wal: Path, db_as_path: bool, wal_as_path: bool) -> None:
-    # Test that the WAL checksum validation works as expected
-    # When validate_checksums=True, only entries before the last checkpoint are visible
+    # With an intact WAL, checksum validation should not change the result:
+    # both modes show the live database state, matching real SQLite behaviour.
     db = sqlite3.SQLite3(
         sqlite_db if db_as_path else sqlite_db.open("rb"),
         sqlite_wal if wal_as_path else sqlite_wal.open("rb"),
         validate_checksums=True,
     )
 
-    _assert_valid_checksum(db)
+    _assert_live_state(db)
 
     db.close()
 
-    # When validate_checksums=False, entries after the last checkpoint are also visible
     db = sqlite3.SQLite3(
         sqlite_db if db_as_path else sqlite_db.open("rb"),
         sqlite_wal if wal_as_path else sqlite_wal.open("rb"),
         validate_checksums=False,
     )
 
-    _assert_invalid_checksum(db)
+    _assert_live_state(db)
 
     db.close()
+
+
+def test_sqlite_wal_checksum_validation_corrupt(sqlite_db: Path, sqlite_wal: Path) -> None:
+    # Corrupt the stored checksum of the first frame of the current WAL generation.
+    # The WAL header is 32 bytes and a frame header is 24 bytes, with checksum1 at frame offset 16.
+    wal_data = bytearray(sqlite_wal.read_bytes())
+    wal_data[32 + 16] ^= 0xFF
+
+    # With validation, the corrupted frame and all frames after it are rejected,
+    # so the database reflects the state at the last checkpoint.
+    db = sqlite3.SQLite3(sqlite_db, io.BytesIO(bytes(wal_data)), validate_checksums=True)
+
+    _assert_checkpoint_state(db)
+
+    db.close()
+
+    # Without validation, the corrupted frames are still applied (salts match),
+    # so the post-checkpoint delete and update are visible.
+    db = sqlite3.SQLite3(sqlite_db, io.BytesIO(bytes(wal_data)), validate_checksums=False)
+
+    _assert_live_state(db)
 
 
 # Assertion functions for test_sqlite_wal_checkpoint()
@@ -202,8 +223,8 @@ def _assert_checkpoint_3(s: sqlite3.SQLite3) -> None:
 
 
 # Assertion functions for test_sqlite_wal_checksum_validation()
-def _assert_valid_checksum(s: sqlite3.SQLite3) -> None:
-    # If the checksum validation is correct, all entries BEFORE the last checkpoint should be present
+def _assert_checkpoint_state(s: sqlite3.SQLite3) -> None:
+    # State as of the last checkpoint: the post-checkpoint delete and update are not applied
     table = next(iter(s.tables()))
     rows = list(table.rows())
 
@@ -244,8 +265,8 @@ def _assert_valid_checksum(s: sqlite3.SQLite3) -> None:
     assert rows[10].value == 101
 
 
-def _assert_invalid_checksum(s: sqlite3.SQLite3) -> None:
-    # If the checksum validation is incorrect, all entries AFTER the last checkpoint should be present
+def _assert_live_state(s: sqlite3.SQLite3) -> None:
+    # Live database state: the post-checkpoint delete and update are applied
     table = next(iter(s.tables()))
     rows = list(table.rows())
 

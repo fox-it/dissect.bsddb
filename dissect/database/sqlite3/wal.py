@@ -39,7 +39,8 @@ class WAL:
             raise InvalidDatabase("Invalid WAL header magic")
 
         self.checksum_endian = "<" if self.header.magic == WAL_HEADER_MAGIC_LE else ">"
-        self._checksum_struct = struct.Struct(f"{self.checksum_endian}2I")
+        # Checksum values are always stored in big-endian format
+        self._checksum_struct = struct.Struct(">2I")
 
         self.frame = lru_cache(1024)(self.frame)
         self.frame_size = len(c_sqlite3.wal_frame) + self.header.page_size
@@ -107,8 +108,8 @@ class WAL:
             if len(frame_hdr_bytes) < len(c_sqlite3.wal_frame):
                 raise EOFError("Incomplete frame header while calculating checksum")
 
-            # Checksum first 16 bytes of frame header
-            seed = calculate_checksum(frame_hdr_bytes[:16], seed=seed, endian=self.checksum_endian)
+            # Checksum first 8 bytes of frame header (page number and page count)
+            seed = calculate_checksum(frame_hdr_bytes[:8], seed=seed, endian=self.checksum_endian)
 
             # Read and checksum page data
             page_data = self.fh.read(self.header.page_size)
